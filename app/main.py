@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
 from .engine import (
+    SensorRequirement,
     compare_sensor,
     evaluate_batch,
     evaluate_quality_gate,
+    evaluate_release,
     evaluate_sample,
     find_sensor_events,
     preview_submission,
@@ -27,6 +32,8 @@ from .models import (
     PreviewResponse,
     QualityGateRequest,
     QualityGateResponse,
+    ReleaseRequest,
+    ReleaseResponse,
     ResetResponse,
     SamplePointResponse,
 )
@@ -73,6 +80,30 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
                 "different event payload"
             )
         },
+    )
+
+
+def _sanitize_error_value(value: object) -> object:
+    """Replace non-finite floats in validation-error details with strings.
+
+    FastAPI's default 422 handler serializes the offending input verbatim and
+    crashes on NaN/Inf (they are not valid JSON), turning a parameter error
+    into a 500. Rendering them as their ``repr`` keeps the 422 contract.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _sanitize_error_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_error_value(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(_sanitize_error_value(exc.errors()))},
     )
 
 
@@ -284,6 +315,49 @@ def quality_gate(batch_id: str, gate: QualityGateRequest) -> QualityGateResponse
             detail=f"sensor {gate.sensor_id!r} not found in batch {batch_id!r}",
         )
     return QualityGateResponse(**doc)
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/release",
+    response_model=ReleaseResponse,
+    tags=["calibration"],
+    summary="Evaluate device-release windows over a batch within a query interval",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def release_batch(batch_id: str, release: ReleaseRequest) -> ReleaseResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    # One lock acquisition for the whole read-only evaluation: the release
+    # windows are computed against one consistent batch snapshot.
+    with store.lock:
+        missing = [
+            s.sensor_id
+            for s in release.sensors
+            if find_sensor_events(batch, s.sensor_id) is None
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"sensor {missing[0]!r} not found in batch {batch_id!r}",
+            )
+        doc = evaluate_release(
+            batch_id,
+            release.start_ns,
+            release.end_ns,
+            release.min_duration_ns,
+            [
+                SensorRequirement(
+                    sensor_id=s.sensor_id,
+                    min_value=s.min_value,
+                    max_value=s.max_value,
+                    unit=s.unit,
+                )
+                for s in release.sensors
+            ],
+            batch,
+        )
+    return ReleaseResponse(**doc)
 
 
 @app.post(

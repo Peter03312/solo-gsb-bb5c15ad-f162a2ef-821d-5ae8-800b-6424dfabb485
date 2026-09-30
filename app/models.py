@@ -313,6 +313,129 @@ class ResetResponse(StrictModel):
     events_removed: int
 
 
+class ReleaseSensorRequirement(StrictModel):
+    """Release criterion for one required sensor.
+
+    The sensor qualifies at an instant when the folded segment covering it is
+    ``calibrated``, carries exactly ``unit`` and its value lies inside the
+    inclusive bounds ``[min_value, max_value]``.
+    """
+
+    sensor_id: SensorId
+    # Inclusive allowed-value bounds: a calibrated value v qualifies iff
+    # min_value <= v <= max_value. NaN/inf bounds are rejected.
+    min_value: float = Field(
+        allow_inf_nan=False,
+        description="Inclusive lower bound of the allowed calibrated value.",
+    )
+    max_value: float = Field(
+        allow_inf_nan=False,
+        description="Inclusive upper bound of the allowed calibrated value.",
+    )
+    # Expected unit of the calibrated value (exact match).
+    unit: str = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "ReleaseSensorRequirement":
+        if self.min_value > self.max_value:
+            raise ValueError("min_value must be less than or equal to max_value")
+        return self
+
+
+class ReleaseRequest(StrictModel):
+    """Parameters for one device-release evaluation over a query window."""
+
+    # Half-open query window [start_ns, end_ns) in batch-local nanoseconds.
+    start_ns: int = Field(ge=0)
+    end_ns: int = Field(ge=1)
+    # A continuous fully-qualified run is releasable only when its duration
+    # reaches this many nanoseconds.
+    min_duration_ns: int = Field(
+        ge=1,
+        description="Minimum continuous qualified duration (ns) required to "
+        "release a window.",
+    )
+    # Required sensors with their criteria; at least one, no duplicates.
+    sensors: list[ReleaseSensorRequirement] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_window_and_sensors(self) -> "ReleaseRequest":
+        if self.end_ns <= self.start_ns:
+            raise ValueError("end_ns must be strictly greater than start_ns")
+        sensor_ids = [s.sensor_id for s in self.sensors]
+        if len(set(sensor_ids)) != len(sensor_ids):
+            raise ValueError("sensors must not contain duplicate sensor_id values")
+        return self
+
+
+class ReleaseWindow(StrictModel):
+    """One maximal continuous span releasable for every required sensor."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+
+
+class ReleaseSensorReason(StrictModel):
+    """Why one required sensor disqualifies a rejected interval."""
+
+    sensor_id: str
+    # uncovered:      no grounded segment covers the span;
+    # withdrawn:      a tombstone segment covers the span;
+    # blocked:        a revision waiting on missing ancestors covers the span;
+    # unit_mismatch:  calibrated, but the unit differs from the expected one;
+    # out_of_range:   calibrated with the expected unit, but the value lies
+    #                 outside the inclusive bounds.
+    reason: Literal[
+        "uncovered", "withdrawn", "blocked", "unit_mismatch", "out_of_range"
+    ]
+    # Actual calibrated value/unit on the span (unit_mismatch / out_of_range);
+    # null otherwise.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Distinct not-yet-uploaded terminal ancestors; populated for blocked
+    # spans (sorted, ready for backfill), empty otherwise.
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
+class ReleaseRejectedInterval(StrictModel):
+    """One half-open span of the query window that is not releasable."""
+
+    start_ns: int
+    end_ns: int
+    duration_ns: int
+    # sensors_disqualified: at least one required sensor fails its criterion
+    #   (see the per-sensor reasons);
+    # duration_too_short:   every sensor qualifies but the continuous
+    #   qualified run is shorter than min_duration_ns.
+    reason: Literal["sensors_disqualified", "duration_too_short"]
+    # Per-sensor failure reasons (sorted by sensor_id); empty for
+    # duration_too_short.
+    sensors: list[ReleaseSensorReason] = Field(default_factory=list)
+
+
+class ReleaseResponse(StrictModel):
+    """Device-release evaluation of one batch over one query window."""
+
+    batch_id: str
+    # Half-open query window the evaluation scanned.
+    window_start_ns: int
+    window_end_ns: int
+    min_duration_ns: int
+    # True iff at least one release window exists.
+    releasable: bool
+    # Maximal continuous spans where every required sensor simultaneously
+    # satisfies its criterion for at least min_duration_ns (time-sorted,
+    # adjacent spans merged).
+    release_windows: list[ReleaseWindow] = Field(default_factory=list)
+    # Time-sorted spans of the query window that are not releasable, each
+    # with its reason(s); adjacent spans with identical reasons are merged.
+    rejected_intervals: list[ReleaseRejectedInterval] = Field(default_factory=list)
+    # SHA-256 over the scan input (folded segments plus blocked spans of
+    # every required sensor); independent of the query parameters.
+    timeline_hash: str
+
+
 class HealthResponse(StrictModel):
     status: Literal["ok"]
     storage: Literal["memory"]

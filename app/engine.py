@@ -296,6 +296,22 @@ def hash_gate_input(segments: list[Segment], blocked_spans: list[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def hash_release_input(sensor_inputs: list[dict]) -> str:
+    """Stable SHA-256 over a release evaluation's multi-sensor scan input.
+
+    Each entry carries one required sensor's folded grounded segments plus its
+    blocked revision spans. The hash depends on the folded batch state only,
+    never on the release query parameters (window, bounds, unit, duration).
+    """
+    payload = json.dumps(
+        {"sensors": sensor_inputs},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Batch-level orchestration
 # ---------------------------------------------------------------------------
@@ -961,4 +977,237 @@ def evaluate_quality_gate(
         "violations": violations,
         "gaps": gaps,
         "timeline_hash": hash_gate_input(segments, blocked_spans),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Device release
+# ---------------------------------------------------------------------------
+
+# Per-sensor disqualification reasons reported inside rejected intervals.
+REASON_UNCOVERED = "uncovered"
+REASON_WITHDRAWN = "withdrawn"
+REASON_BLOCKED = "blocked"
+REASON_UNIT_MISMATCH = "unit_mismatch"
+REASON_OUT_OF_RANGE = "out_of_range"
+
+# Interval-level reasons for a rejected (non-releasable) span.
+REJECT_SENSORS_DISQUALIFIED = "sensors_disqualified"
+REJECT_DURATION_TOO_SHORT = "duration_too_short"
+
+
+@dataclass(frozen=True)
+class SensorRequirement:
+    """Release criterion for one required sensor.
+
+    A sensor satisfies its criterion at an instant when the folded segment
+    covering it is ``calibrated``, carries exactly ``unit`` and its value lies
+    inside the inclusive bounds ``[min_value, max_value]``.
+    """
+
+    sensor_id: str
+    min_value: float
+    max_value: float
+    unit: str
+
+
+def _sensor_reason(
+    requirement: SensorRequirement,
+    lo: int,
+    segments: list[Segment],
+    cursor: int,
+    blocked: list[StoredEvent],
+    sensor_events: dict[str, StoredEvent],
+) -> tuple[Optional[dict], int]:
+    """Classify one sensor at instant ``lo``; ``None`` means qualified.
+
+    Blocking takes precedence over grounded coverage (backfilling the missing
+    ancestors could still change the fold winner), exactly as in the sample
+    and quality-gate evaluations. Returns ``(reason, cursor)`` where ``cursor``
+    is the advanced monotonic segment cursor.
+    """
+    covering = [e for e in blocked if e.start_ns <= lo < e.end_ns]
+    if covering:
+        return (
+            {
+                "sensor_id": requirement.sensor_id,
+                "reason": REASON_BLOCKED,
+                "value": None,
+                "unit": None,
+                "missing_ancestors": _terminal_missing_ancestors(
+                    [e.revision_id for e in covering], sensor_events
+                ),
+            },
+            cursor,
+        )
+    while cursor < len(segments) and segments[cursor].end_ns <= lo:
+        cursor += 1
+    seg = (
+        segments[cursor]
+        if cursor < len(segments) and segments[cursor].start_ns <= lo
+        else None
+    )
+    base = {"sensor_id": requirement.sensor_id, "missing_ancestors": []}
+    if seg is None:
+        return {**base, "reason": REASON_UNCOVERED, "value": None, "unit": None}, cursor
+    if seg.state == "withdrawn":
+        return {**base, "reason": REASON_WITHDRAWN, "value": None, "unit": None}, cursor
+    payload = {
+        **base,
+        "value": None if seg.value is None else float(seg.value),
+        "unit": seg.unit,
+    }
+    if seg.unit != requirement.unit:
+        return {**payload, "reason": REASON_UNIT_MISMATCH}, cursor
+    if not (requirement.min_value <= seg.value <= requirement.max_value):
+        return {**payload, "reason": REASON_OUT_OF_RANGE}, cursor
+    return None, cursor
+
+
+def evaluate_release(
+    batch_id: str,
+    start_ns: int,
+    end_ns: int,
+    min_duration_ns: int,
+    requirements: list[SensorRequirement],
+    store: BatchStore,
+) -> Optional[dict]:
+    """Find windows where every required sensor simultaneously qualifies.
+
+    Deterministic half-open sweep of the query window ``[start_ns, end_ns)``
+    over the folded timelines of all required sensors (same causal-fold rules
+    as the batch result; invalid cycle members never participate). An instant
+    is qualified iff every required sensor satisfies its criterion there.
+    Adjacent qualified instants merge into runs; only runs whose duration
+    reaches ``min_duration_ns`` become release windows, shorter runs are
+    rejected as ``duration_too_short``. Every other span of the window is
+    rejected as ``sensors_disqualified`` with the per-sensor reasons; adjacent
+    spans with identical reason payloads merge.
+
+    Returns ``None`` when any required sensor is unknown in this batch.
+    """
+    prepared: list[tuple[SensorRequirement, list[Segment], list[StoredEvent], dict[str, StoredEvent]]] = []
+    for requirement in requirements:
+        sensor_events = find_sensor_events(store, requirement.sensor_id)
+        if sensor_events is None:
+            return None
+        states, depths = classify_sensor(sensor_events)
+        segments = build_timeline(
+            [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED],
+            depths,
+        )
+        blocked = sorted(
+            (e for e in sensor_events.values() if states[e.revision_id] == BLOCKED),
+            key=lambda e: (e.start_ns, e.end_ns, e.revision_id),
+        )
+        prepared.append((requirement, segments, blocked, sensor_events))
+
+    # Elementary partition of the query window: every segment or blocked-span
+    # boundary clipped to [start_ns, end_ns) is a split point.
+    points = {start_ns, end_ns}
+    for _, segments, blocked, _ in prepared:
+        for seg in segments:
+            if seg.end_ns > start_ns and seg.start_ns < end_ns:
+                points.add(max(seg.start_ns, start_ns))
+                points.add(min(seg.end_ns, end_ns))
+        for event in blocked:
+            if event.end_ns > start_ns and event.start_ns < end_ns:
+                points.add(max(event.start_ns, start_ns))
+                points.add(min(event.end_ns, end_ns))
+    ordered_points = sorted(points)
+
+    release_windows: list[dict] = []
+    rejected: list[dict] = []
+    qualified_start: Optional[int] = None
+    qualified_end: Optional[int] = None
+
+    def close_qualified_run() -> None:
+        nonlocal qualified_start, qualified_end
+        if qualified_start is None:
+            return
+        duration = qualified_end - qualified_start
+        if duration >= min_duration_ns:
+            release_windows.append(
+                {
+                    "start_ns": qualified_start,
+                    "end_ns": qualified_end,
+                    "duration_ns": duration,
+                }
+            )
+        else:
+            rejected.append(
+                {
+                    "start_ns": qualified_start,
+                    "end_ns": qualified_end,
+                    "duration_ns": duration,
+                    "reason": REJECT_DURATION_TOO_SHORT,
+                    "sensors": [],
+                }
+            )
+        qualified_start = qualified_end = None
+
+    cursors = [0] * len(prepared)
+    for lo, hi in zip(ordered_points, ordered_points[1:]):
+        reasons: list[dict] = []
+        for idx, (requirement, segments, blocked, sensor_events) in enumerate(prepared):
+            reason, cursors[idx] = _sensor_reason(
+                requirement, lo, segments, cursors[idx], blocked, sensor_events
+            )
+            if reason is not None:
+                reasons.append(reason)
+        if not reasons:
+            if qualified_start is None:
+                qualified_start, qualified_end = lo, hi
+            else:
+                qualified_end = hi
+            continue
+        close_qualified_run()
+        reasons.sort(key=lambda r: r["sensor_id"])
+        if (
+            rejected
+            and rejected[-1]["reason"] == REJECT_SENSORS_DISQUALIFIED
+            and rejected[-1]["end_ns"] == lo
+            and rejected[-1]["sensors"] == reasons
+        ):
+            rejected[-1]["end_ns"] = hi
+            rejected[-1]["duration_ns"] = hi - rejected[-1]["start_ns"]
+        else:
+            rejected.append(
+                {
+                    "start_ns": lo,
+                    "end_ns": hi,
+                    "duration_ns": hi - lo,
+                    "reason": REJECT_SENSORS_DISQUALIFIED,
+                    "sensors": reasons,
+                }
+            )
+    close_qualified_run()
+
+    hash_input = sorted(
+        (
+            {
+                "sensor_id": requirement.sensor_id,
+                "segments": [segment_to_dict(s) for s in segments],
+                "blocked": [
+                    {
+                        "start_ns": e.start_ns,
+                        "end_ns": e.end_ns,
+                        "revision_id": e.revision_id,
+                    }
+                    for e in blocked
+                ],
+            }
+            for requirement, segments, blocked, _ in prepared
+        ),
+        key=lambda entry: entry["sensor_id"],
+    )
+    return {
+        "batch_id": batch_id,
+        "window_start_ns": start_ns,
+        "window_end_ns": end_ns,
+        "min_duration_ns": min_duration_ns,
+        "releasable": bool(release_windows),
+        "release_windows": release_windows,
+        "rejected_intervals": rejected,
+        "timeline_hash": hash_release_input(hash_input),
     }
